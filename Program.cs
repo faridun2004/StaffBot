@@ -1,129 +1,213 @@
-// =====================================================================
-//  StaffBot — Telegram-бот статусов сотрудников (ASP.NET Core 8, один файл)
-//  Сотрудник выбирает статус в личке с ботом, бот пишет его в рабочую группу.
-//  Работает через long polling, без внешних Telegram-библиотек (чистый HTTP API).
-//  Хранение: SQLite (/data/staff.db на Railway — подключите Volume).
-// =====================================================================
 using Microsoft.Data.Sqlite;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+
+// =====================================================================
+// CONFIGURATION
+// =====================================================================
 
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+
 var builder = WebApplication.CreateBuilder(args);
+
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
 var token = Environment.GetEnvironmentVariable("BOT_TOKEN");
+
 if (string.IsNullOrWhiteSpace(token))
-    throw new InvalidOperationException("Не задана переменная окружения BOT_TOKEN");
+    throw new InvalidOperationException("BOT_TOKEN is not configured.");
 
 var admins = (Environment.GetEnvironmentVariable("ADMIN_IDS") ?? "")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-    .Where(s => long.TryParse(s, out _))
+    .Where(x => long.TryParse(x, out _))
     .Select(long.Parse)
     .ToHashSet();
 
-long? envGroup = long.TryParse(Environment.GetEnvironmentVariable("GROUP_ID"), out var g) ? g : null;
-var dbPath = Environment.GetEnvironmentVariable("DB_PATH") ?? "staff.db";
+long? envGroup = long.TryParse(
+    Environment.GetEnvironmentVariable("GROUP_ID"),
+    out var groupId)
+        ? groupId
+        : null;
+
+var dbPath = Environment.GetEnvironmentVariable("DB_PATH")
+             ?? "data/staff.db";
 
 builder.Services.AddSingleton(new Settings(token, admins, envGroup));
+
 builder.Services.AddSingleton(new Db(dbPath));
+
 builder.Services.AddSingleton(new Tg(token));
+
 builder.Services.AddHostedService<BotService>();
 
 var app = builder.Build();
+
 app.MapGet("/", () => "StaffBot is running");
+
 app.MapGet("/health", () => Results.Ok("ok"));
+
 app.Run();
 
 // =====================================================================
-//  Настройки и справочник статусов
+// SETTINGS
 // =====================================================================
-record Settings(string Token, HashSet<long> Admins, long? EnvGroup);
 
-// Dur: Phrase — готовая фраза для группы; если Phrase == null, бот спросит текст (Ask)
-record Dur(string Code, string Label, string? Phrase, string? Ask);
-record Status(string Key, string Emoji, string Action, string Button, Dur[] Durs);
+record Settings(
+    string Token,
+    HashSet<long> Admins,
+    long? EnvGroup);
+
+// =====================================================================
+// STATUS MODELS
+// =====================================================================
+
+record Dur(
+    string Code,
+    string Label,
+    string? Phrase,
+    string? Ask);
+
+record Status(
+    string Key,
+    string Emoji,
+    string Action,
+    string Button,
+    Dur[] Durs);
+
+// =====================================================================
+// STATUS DATA
+// =====================================================================
 
 static class Data
 {
     public static readonly Status[] All =
     {
-        new("remote", "🏠", "работает удалённо", "🏠 Работаю удалённо", new Dur[]
-        {
-            new("lunch", "До обеда", "до обеда", null),
-            new("today", "Сегодня", "сегодня", null),
-            new("period", "Период", null, "Напишите период, например: 27.11 – 30.11"),
-        }),
-        new("late", "⏰", "задерживается", "⏰ Задерживаюсь", new Dur[]
-        {
-            new("15", "15 минут", "на 15 минут", null),
-            new("30", "30 минут", "на 30 минут", null),
-            new("60", "1 час", "на 1 час", null),
-            new("custom", "Указать время", null, "Напишите, насколько задержитесь, например: до 10:30"),
-        }),
-        new("leave", "🚪", "отпросился", "🚪 Отпросился", new Dur[]
-        {
-            new("lunch", "До обеда", "до обеда", null),
-            new("afterlunch", "После обеда", "после обеда", null),
-            new("today", "На весь день", "на весь день", null),
-            new("custom", "Указать время", null, "Напишите время, например: с 15:00 до 17:00"),
-        }),
-        new("away", "🚶", "отошёл", "🚶 Отошёл", new Dur[]
-        {
-            new("15", "15 минут", "на 15 минут", null),
-            new("30", "30 минут", "на 30 минут", null),
-            new("60", "1 час", "на 1 час", null),
-            new("custom", "Указать время", null, "Напишите, на сколько отошли, например: на 20 минут"),
-        }),
-        new("sick", "🤒", "болеет", "🤒 Болезнь", new Dur[]
-        {
-            new("today", "Сегодня", "сегодня", null),
-            new("period", "Период", null, "Напишите период болезни, например: 27.11 – 30.11"),
-        }),
-        new("vacation", "🏖", "в отпуске / на отгуле", "🏖 Отпуск / отгул", new Dur[]
-        {
-            new("today", "Сегодня", "сегодня", null),
-            new("period", "Период", null, "Напишите период, например: 01.12 – 14.12"),
-        }),
-        new("trip", "🚗", "в командировке / на встрече", "🚗 Командировка / встреча", new Dur[]
-        {
-            new("today", "Сегодня", "сегодня", null),
-            new("custom", "Указать детали", null, "Напишите детали, например: встреча с клиентом до 14:00"),
-        }),
-        new("back", "✅", "на месте", "✅ Я на месте / вернулся", Array.Empty<Dur>()),
-        new("other", "📝", "", "📝 Другое", Array.Empty<Dur>()),
+        new("remote", "🏠", "работает удалённо",
+            "🏠 Работаю удалённо",
+            new Dur[]
+            {
+                new("lunch", "До обеда", "до обеда", null),
+                new("today", "Сегодня", "сегодня", null),
+                new("period", "Период", null,
+                    "Напишите период, например: 27.11 – 30.11")
+            }),
+
+        new("late", "⏰", "задерживается",
+            "⏰ Задерживаюсь",
+            new Dur[]
+            {
+                new("15", "15 минут", "на 15 минут", null),
+                new("30", "30 минут", "на 30 минут", null),
+                new("60", "1 час", "на 1 час", null),
+                new("custom", "Указать время", null,
+                    "Напишите время, например: до 10:30")
+            }),
+
+        new("leave", "🚪", "отпросился",
+            "🚪 Отпросился",
+            new Dur[]
+            {
+                new("lunch", "До обеда", "до обеда", null),
+                new("afterlunch", "После обеда", "после обеда", null),
+                new("today", "На весь день", "на весь день", null),
+                new("custom", "Указать время", null,
+                    "Напишите время, например: с 15:00 до 17:00")
+            }),
+
+        new("away", "🚶", "отошёл",
+            "🚶 Отошёл",
+            new Dur[]
+            {
+                new("15", "15 минут", "на 15 минут", null),
+                new("30", "30 минут", "на 30 минут", null),
+                new("60", "1 час", "на 1 час", null),
+                new("custom", "Указать время", null,
+                    "Напишите, на сколько отошли, например: на 20 минут")
+            }),
+
+        new("sick", "🤒", "болеет",
+            "🤒 Болезнь",
+            new Dur[]
+            {
+                new("today", "Сегодня", "сегодня", null),
+                new("period", "Период", null,
+                    "Напишите период болезни, например: 27.11 – 30.11")
+            }),
+
+        new("vacation", "🏖", "в отпуске / на отгуле",
+            "🏖 Отпуск / отгул",
+            new Dur[]
+            {
+                new("today", "Сегодня", "сегодня", null),
+                new("period", "Период", null,
+                    "Напишите период, например: 01.12 – 14.12")
+            }),
+
+        new("trip", "🚗", "в командировке / на встрече",
+            "🚗 Командировка / встреча",
+            new Dur[]
+            {
+                new("today", "Сегодня", "сегодня", null),
+                new("custom", "Указать детали", null,
+                    "Напишите детали, например: встреча с клиентом до 14:00")
+            }),
+
+        new("back", "✅", "на месте",
+            "✅ Я на месте / вернулся",
+            Array.Empty<Dur>()),
+
+        new("other", "📝", "",
+            "📝 Другое",
+            Array.Empty<Dur>())
     };
 
-    public static Status? Find(string key) => All.FirstOrDefault(s => s.Key == key);
+    public static Status? Find(string key) =>
+        All.FirstOrDefault(x => x.Key == key);
 }
 
 // =====================================================================
-//  База данных (SQLite)
+// DATABASE
 // =====================================================================
+
 class Db
 {
-    private readonly SqliteConnection _c;
-    private readonly object _l = new();
+    private readonly SqliteConnection _connection;
+    private readonly object _lock = new();
+
+    private static long UnixNow =>
+        DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
     public Db(string path)
     {
-        var dir = Path.GetDirectoryName(Path.GetFullPath(path));
-        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-        _c = new SqliteConnection($"Data Source={path}");
-        _c.Open();
-        Exec(@"
+        var fullPath = Path.GetFullPath(path);
+
+        var directory = Path.GetDirectoryName(fullPath);
+
+        if (!string.IsNullOrEmpty(directory))
+            Directory.CreateDirectory(directory);
+
+        _connection = new SqliteConnection(
+            $"Data Source={fullPath}");
+
+        _connection.Open();
+
+        Execute("""
             CREATE TABLE IF NOT EXISTS users (
                 tg_id INTEGER PRIMARY KEY,
                 full_name TEXT NOT NULL,
                 username TEXT,
                 created_at TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tg_id INTEGER NOT NULL,
@@ -131,130 +215,390 @@ class Db
                 details TEXT,
                 created_at TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS states (
                 tg_id INTEGER PRIMARY KEY,
                 state TEXT NOT NULL,
-                key TEXT
-            );");
+                key TEXT,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_log_tg_id
+            ON log(tg_id);
+
+            """);
     }
 
-    private static string Now() => DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
+    private static string Now() =>
+        DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
 
-    private int Exec(string sql, params (string, object?)[] p)
+    private int Execute(
+        string sql,
+        params (string Name, object? Value)[] parameters)
     {
-        lock (_l)
+        lock (_lock)
         {
-            using var cmd = _c.CreateCommand();
+            using var cmd = _connection.CreateCommand();
+
             cmd.CommandText = sql;
-            foreach (var (n, v) in p) cmd.Parameters.AddWithValue(n, v ?? DBNull.Value);
+
+            foreach (var p in parameters)
+            {
+                cmd.Parameters.AddWithValue(
+                    p.Name,
+                    p.Value ?? DBNull.Value);
+            }
+
             return cmd.ExecuteNonQuery();
         }
     }
 
-    private List<object?[]> Query(string sql, params (string, object?)[] p)
+    private List<object?[]> Query(
+        string sql,
+        params (string Name, object? Value)[] parameters)
     {
-        lock (_l)
+        lock (_lock)
         {
-            using var cmd = _c.CreateCommand();
+            using var cmd = _connection.CreateCommand();
+
             cmd.CommandText = sql;
-            foreach (var (n, v) in p) cmd.Parameters.AddWithValue(n, v ?? DBNull.Value);
-            using var r = cmd.ExecuteReader();
-            var rows = new List<object?[]>();
-            while (r.Read())
+
+            foreach (var p in parameters)
             {
-                var row = new object?[r.FieldCount];
-                for (var i = 0; i < r.FieldCount; i++) row[i] = r.IsDBNull(i) ? null : r.GetValue(i);
-                rows.Add(row);
+                cmd.Parameters.AddWithValue(
+                    p.Name,
+                    p.Value ?? DBNull.Value);
             }
-            return rows;
+
+            using var reader = cmd.ExecuteReader();
+
+            var result = new List<object?[]>();
+
+            while (reader.Read())
+            {
+                var row = new object?[reader.FieldCount];
+
+                for (var i = 0; i < reader.FieldCount; i++)
+                {
+                    row[i] = reader.IsDBNull(i)
+                        ? null
+                        : reader.GetValue(i);
+                }
+
+                result.Add(row);
+            }
+
+            return result;
         }
     }
 
-    // --- сотрудники ---
-    public string? GetName(long id) =>
-        Query("SELECT full_name FROM users WHERE tg_id=$id", ("$id", id)).FirstOrDefault()?[0] as string;
+    // -------------------------------------------------------------
+    // USERS
+    // -------------------------------------------------------------
 
-    public void SaveUser(long id, string name, string? username) =>
-        Exec(@"INSERT INTO users(tg_id, full_name, username, created_at) VALUES($id,$n,$u,$t)
-               ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name,
-               username=COALESCE(excluded.username, users.username)",
-            ("$id", id), ("$n", name), ("$u", username), ("$t", Now()));
+    public string? GetName(long id)
+    {
+        return Query(
+            "SELECT full_name FROM users WHERE tg_id=$id",
+            ("$id", id))
+            .FirstOrDefault()?[0] as string;
+    }
 
-    public bool Rename(long id, string name) =>
-        Exec("UPDATE users SET full_name=$n WHERE tg_id=$id", ("$n", name), ("$id", id)) > 0;
+    public void SaveUser(
+        long id,
+        string name,
+        string? username)
+    {
+        Execute("""
+            INSERT INTO users(
+                tg_id,
+                full_name,
+                username,
+                created_at)
+            VALUES($id,$name,$username,$created)
+
+            ON CONFLICT(tg_id)
+            DO UPDATE SET
+                full_name=excluded.full_name,
+                username=COALESCE(
+                    excluded.username,
+                    users.username)
+            """,
+            ("$id", id),
+            ("$name", name),
+            ("$username", username),
+            ("$created", Now()));
+    }
+
+    public bool Rename(long id, string name)
+    {
+        return Execute(
+            "UPDATE users SET full_name=$name WHERE tg_id=$id",
+            ("$name", name),
+            ("$id", id)) > 0;
+    }
 
     public void DeleteUser(long id)
     {
-        Exec("DELETE FROM users WHERE tg_id=$id", ("$id", id));
+        Execute(
+            "DELETE FROM users WHERE tg_id=$id",
+            ("$id", id));
+
         ClearState(id);
     }
 
-    public List<(long Id, string Name, string? Username)> Users() =>
-        Query("SELECT tg_id, full_name, username FROM users ORDER BY full_name")
-            .Select(r => ((long)r[0]!, (string)r[1]!, r[2] as string)).ToList();
-
-    // --- группа ---
-    public long? GetGroupId()
+    public List<(long Id, string Name, string? Username)> Users()
     {
-        var v = Query("SELECT value FROM settings WHERE key='group_id'").FirstOrDefault()?[0] as string;
-        return long.TryParse(v, out var id) ? id : null;
+        return Query("""
+            SELECT tg_id, full_name, username
+            FROM users
+            ORDER BY full_name
+            """)
+            .Select(x =>
+                ((long)x[0]!,
+                 (string)x[1]!,
+                 x[2] as string))
+            .ToList();
     }
 
-    public void SetGroupId(long id) =>
-        Exec(@"INSERT INTO settings(key, value) VALUES('group_id', $v)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value", ("$v", id.ToString()));
+    // -------------------------------------------------------------
+    // GROUP
+    // -------------------------------------------------------------
 
-    // --- журнал ---
-    public void Log(long id, string status, string details) =>
-        Exec("INSERT INTO log(tg_id, status, details, created_at) VALUES($id,$s,$d,$t)",
-            ("$id", id), ("$s", status), ("$d", details), ("$t", Now()));
+    public long? GetGroupId()
+    {
+        var value = Query("""
+            SELECT value FROM settings
+            WHERE key='group_id'
+            """).FirstOrDefault()?[0] as string;
 
-    // --- состояние диалога ---
-    public void SetState(long id, string state, string? key = null) =>
-        Exec(@"INSERT INTO states(tg_id, state, key) VALUES($id,$s,$k)
-               ON CONFLICT(tg_id) DO UPDATE SET state=excluded.state, key=excluded.key",
-            ("$id", id), ("$s", state), ("$k", key));
+        return long.TryParse(value, out var id)
+            ? id
+            : null;
+    }
+
+    public void SetGroupId(long id)
+    {
+        Execute("""
+            INSERT INTO settings(key,value)
+            VALUES('group_id',$value)
+
+            ON CONFLICT(key)
+            DO UPDATE SET value=excluded.value
+            """,
+            ("$value", id.ToString()));
+    }
+
+    // -------------------------------------------------------------
+    // LOG
+    // -------------------------------------------------------------
+
+    public void Log(
+        long id,
+        string status,
+        string details)
+    {
+        Execute("""
+            INSERT INTO log(
+                tg_id,
+                status,
+                details,
+                created_at)
+            VALUES($id,$status,$details,$created)
+            """,
+            ("$id", id),
+            ("$status", status),
+            ("$details", details),
+            ("$created", Now()));
+    }
+
+    // -------------------------------------------------------------
+    // STATES
+    // -------------------------------------------------------------
+
+    public void SetState(
+        long id,
+        string state,
+        string? key = null)
+    {
+        Execute("""
+            INSERT INTO states(
+                tg_id,
+                state,
+                key,
+                updated_at)
+            VALUES($id,$state,$key,$updated)
+
+            ON CONFLICT(tg_id)
+            DO UPDATE SET
+                state=excluded.state,
+                key=excluded.key,
+                updated_at=excluded.updated_at
+            """,
+            ("$id", id),
+            ("$state", state),
+            ("$key", key),
+            ("$updated", UnixNow));
+    }
+
+    // Создаём состояние только если его ещё нет.
+    // Защищает от повторного выбора статуса.
+
+    public bool TryStartState(
+        long id,
+        string state,
+        string? key)
+    {
+        return Execute("""
+            INSERT INTO states(
+                tg_id,
+                state,
+                key,
+                updated_at)
+            VALUES($id,$state,$key,$updated)
+
+            ON CONFLICT(tg_id) DO NOTHING
+            """,
+            ("$id", id),
+            ("$state", state),
+            ("$key", key),
+            ("$updated", UnixNow)) > 0;
+    }
+
+    // Атомарная смена состояния.
+
+    public bool TryTransitionState(
+        long id,
+        string expectedState,
+        string? expectedKey,
+        string newState,
+        string? newKey = null)
+    {
+        return Execute("""
+            UPDATE states
+            SET state=$newState,
+                key=$newKey,
+                updated_at=$updated
+
+            WHERE tg_id=$id
+              AND state=$expectedState
+              AND key IS $expectedKey
+            """,
+            ("$id", id),
+            ("$expectedState", expectedState),
+            ("$expectedKey", expectedKey),
+            ("$newState", newState),
+            ("$newKey", newKey),
+            ("$updated", UnixNow)) > 0;
+    }
 
     public (string State, string? Key)? GetState(long id)
     {
-        var r = Query("SELECT state, key FROM states WHERE tg_id=$id", ("$id", id)).FirstOrDefault();
-        return r == null ? null : ((string)r[0]!, r[1] as string);
+        var row = Query("""
+            SELECT state, key, updated_at
+            FROM states
+            WHERE tg_id=$id
+            """,
+            ("$id", id)).FirstOrDefault();
+
+        if (row == null)
+            return null;
+
+        var updated = (long)row[2]!;
+
+        // Автоматическая отмена через 5 минут.
+
+        if (UnixNow - updated > 300)
+        {
+            ClearState(id);
+            return null;
+        }
+
+        return (
+            (string)row[0]!,
+            row[1] as string);
     }
 
-    public void ClearState(long id) => Exec("DELETE FROM states WHERE tg_id=$id", ("$id", id));
+    public void ClearState(long id)
+    {
+        Execute(
+            "DELETE FROM states WHERE tg_id=$id",
+            ("$id", id));
+    }
 }
 
 // =====================================================================
-//  Клиент Telegram Bot API (чистый HTTP)
+// TELEGRAM HTTP CLIENT
 // =====================================================================
+
 class Tg
 {
-    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(70) };
-    private readonly string _base;
-
-    private static readonly JsonSerializerOptions Opts = new()
+    private readonly HttpClient _http = new()
     {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+        Timeout = TimeSpan.FromSeconds(70)
     };
 
-    public Tg(string token) => _base = $"https://api.telegram.org/bot{token}/";
+    private readonly string _base;
 
-    public async Task<JsonNode?> Call(string method, object payload, CancellationToken ct = default)
+    private static readonly JsonSerializerOptions Options = new()
     {
-        using var content = new StringContent(JsonSerializer.Serialize(payload, Opts), Encoding.UTF8, "application/json");
-        using var resp = await _http.PostAsync(_base + method, content, ct);
-        var body = await resp.Content.ReadAsStringAsync(ct);
-        var json = JsonNode.Parse(body)!;
-        if (json["ok"]?.GetValue<bool>() != true)
-            throw new Exception($"Telegram {method}: {json["description"]}");
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder
+            .UnsafeRelaxedJsonEscaping
+    };
+
+    public Tg(string token)
+    {
+        _base = $"https://api.telegram.org/bot{token}/";
+    }
+
+    public async Task<JsonNode?> Call(
+        string method,
+        object payload,
+        CancellationToken ct = default)
+    {
+        using var content = new StringContent(
+            JsonSerializer.Serialize(payload, Options),
+            Encoding.UTF8,
+            "application/json");
+
+        using var response = await _http.PostAsync(
+            _base + method,
+            content,
+            ct);
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+
+        var json = JsonNode.Parse(body);
+
+        if (json?["ok"]?.GetValue<bool>() != true)
+        {
+            throw new Exception(
+                $"Telegram {method}: {json?["description"]}");
+        }
+
         return json["result"];
     }
 
-    public Task Send(long chatId, string text, object? markup = null) =>
-        Call("sendMessage", new { chat_id = chatId, text, parse_mode = "HTML", reply_markup = markup });
+    public Task Send(
+        long chatId,
+        string text,
+        object? markup = null)
+    {
+        return Call("sendMessage", new
+        {
+            chat_id = chatId,
+            text,
+            parse_mode = "HTML",
+            reply_markup = markup
+        });
+    }
 
-    public async Task Edit(long chatId, long messageId, string text, object? markup = null)
+    public async Task Edit(
+        long chatId,
+        long messageId,
+        string text,
+        object? markup = null)
     {
         try
         {
@@ -267,352 +611,1070 @@ class Tg
                 reply_markup = markup
             });
         }
-        catch (Exception e) when (e.Message.Contains("not modified")) { /* ничего страшного */ }
+        catch (Exception e) when (
+            e.Message.Contains("not modified",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            // Сообщение не изменилось.
+        }
     }
 
-    public Task Answer(string callbackId, string? text = null, bool alert = false) =>
-        Call("answerCallbackQuery", new { callback_query_id = callbackId, text, show_alert = alert });
-
-    public static object Keyboard(IEnumerable<IEnumerable<(string Text, string Data)>> rows) => new
+    public Task Answer(
+        string callbackId,
+        string? text = null,
+        bool alert = false)
     {
-        inline_keyboard = rows.Select(r => r.Select(b => new { text = b.Text, callback_data = b.Data }).ToArray()).ToArray()
-    };
+        return Call("answerCallbackQuery", new
+        {
+            callback_query_id = callbackId,
+            text,
+            show_alert = alert
+        });
+    }
+
+    public static object Keyboard(
+        IEnumerable<IEnumerable<(string Text, string Data)>> rows)
+    {
+        return new
+        {
+            inline_keyboard = rows
+                .Select(row => row.Select(button => new
+                {
+                    text = button.Text,
+                    callback_data = button.Data
+                }).ToArray())
+                .ToArray()
+        };
+    }
 }
 
 // =====================================================================
-//  Логика бота (фоновый сервис, long polling)
+// BOT SERVICE
 // =====================================================================
+
 class BotService : BackgroundService
 {
-    private readonly Settings _s;
+    private readonly Settings _settings;
     private readonly Db _db;
     private readonly Tg _tg;
     private readonly ILogger<BotService> _log;
 
-    public BotService(Settings s, Db db, Tg tg, ILogger<BotService> log)
+    public BotService(
+        Settings settings,
+        Db db,
+        Tg tg,
+        ILogger<BotService> log)
     {
-        _s = s; _db = db; _tg = tg; _log = log;
+        _settings = settings;
+        _db = db;
+        _tg = tg;
+        _log = log;
     }
+
+    // -------------------------------------------------------------
+    // START
+    // -------------------------------------------------------------
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        // на случай, если ранее был установлен webhook
-        try { await _tg.Call("deleteWebhook", new { drop_pending_updates = false }, ct); } catch { }
+        try
+        {
+            await _tg.Call(
+                "deleteWebhook",
+                new { drop_pending_updates = false },
+                ct);
+        }
+        catch (Exception e)
+        {
+            _log.LogWarning(e, "Could not delete webhook.");
+        }
 
-        _log.LogInformation("Бот запущен, ожидаю обновления...");
+        _log.LogInformation("StaffBot started.");
+
         long offset = 0;
+
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                var res = await _tg.Call("getUpdates", new
-                {
-                    offset,
-                    timeout = 30,
-                    allowed_updates = new[] { "message", "callback_query" }
-                }, ct);
+                var result = await _tg.Call(
+                    "getUpdates",
+                    new
+                    {
+                        offset,
+                        timeout = 30,
+                        allowed_updates = new[]
+                        {
+                            "message",
+                            "callback_query"
+                        }
+                    },
+                    ct);
 
-                foreach (var u in res!.AsArray())
+                if (result is not JsonArray updates)
+                    continue;
+
+                foreach (var update in updates)
                 {
-                    offset = u!["update_id"]!.GetValue<long>() + 1;
+                    if (update == null)
+                        continue;
+
+                    offset = update["update_id"]!.GetValue<long>() + 1;
+
                     try
                     {
-                        if (u["message"] is JsonNode m) await OnMessage(m);
-                        else if (u["callback_query"] is JsonNode cb) await OnCallback(cb);
+                        if (update["message"] is JsonNode message)
+                            await OnMessage(message);
+
+                        else if (update["callback_query"] is JsonNode callback)
+                            await OnCallback(callback);
                     }
                     catch (Exception e)
                     {
-                        _log.LogError(e, "Ошибка обработки обновления");
+                        _log.LogError(e, "Update processing error.");
                     }
                 }
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
             catch (Exception e)
             {
-                _log.LogError(e, "Ошибка получения обновлений");
+                _log.LogError(e, "Polling error.");
+
                 await Task.Delay(3000, ct);
             }
         }
     }
 
-    // ---------- утилиты ----------
-    private static string Esc(string s) => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+    // -------------------------------------------------------------
+    // HELPERS
+    // -------------------------------------------------------------
+
+    private static string Esc(string value)
+    {
+        return value
+            .Replace("&", "&amp;")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;");
+    }
+
+    private static string NormalizeName(string text)
+    {
+        return string.Join(
+            ' ',
+            text.Split(
+                ' ',
+                StringSplitOptions.RemoveEmptyEntries |
+                StringSplitOptions.TrimEntries));
+    }
 
     private static bool ValidName(string text)
     {
-        var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        return parts.Length >= 2 && text.Length <= 80 && parts.All(p => !p.All(char.IsDigit));
+        var parts = text.Split(
+            ' ',
+            StringSplitOptions.RemoveEmptyEntries);
+
+        return parts.Length >= 2 &&
+               text.Length <= 80 &&
+               parts.All(x => !x.All(char.IsDigit));
     }
 
-    private static string NormalizeName(string text) =>
-        string.Join(' ', text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-
-    private bool IsAdmin(long id) => _s.Admins.Contains(id);
-
-    private static object MainMenu() =>
-        Tg.Keyboard(Data.All.Select(s => new[] { (s.Button, $"st:{s.Key}") }));
-
-    private static object DurationsMenu(Status st)
+    private bool IsAdmin(long id)
     {
-        var rows = st.Durs.Select(d => (d.Label, $"du:{st.Key}:{d.Code}")).Chunk(2)
-            .Select(c => c.AsEnumerable()).ToList();
-        rows.Add(new[] { ("⬅️ Назад", "menu") });
+        return _settings.Admins.Contains(id);
+    }
+
+    private static object MainMenu()
+    {
+        return Tg.Keyboard(
+            Data.All.Select(x =>
+                new[] { (x.Button, $"st:{x.Key}") }));
+    }
+
+    private static object DurationsMenu(Status status)
+    {
+        var rows = status.Durs
+            .Select(x => (x.Label, $"du:{status.Key}:{x.Code}"))
+            .Chunk(2)
+            .Select(x => x.AsEnumerable())
+            .ToList();
+
+        rows.Add(new[] { ("⬅️ Отмена", "cancel") });
+
         return Tg.Keyboard(rows);
     }
 
-    // ---------- сообщения ----------
-    private async Task OnMessage(JsonNode m)
-    {
-        var chat = m["chat"]!;
-        var chatId = chat["id"]!.GetValue<long>();
-        var type = chat["type"]!.GetValue<string>();
-        var from = m["from"];
-        if (from == null) return;
-        var uid = from["id"]!.GetValue<long>();
-        var username = from["username"]?.GetValue<string>();
-        var text = m["text"]?.GetValue<string>()?.Trim();
-        if (string.IsNullOrEmpty(text)) return;
+    // -------------------------------------------------------------
+    // VALIDATION: PERIOD
+    // -------------------------------------------------------------
 
-        string? cmd = null;
-        var args = "";
-        if (text.StartsWith('/'))
+    private static bool ValidatePeriod(
+        string text,
+        out string error)
+    {
+        error = "";
+
+        var parts = Regex.Split(text, @"\s*[–—-]\s*");
+
+        if (parts.Length != 2)
         {
-            var sp = text.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
-            cmd = sp[0][1..].Split('@')[0].ToLowerInvariant();
-            args = sp.Length > 1 ? sp[1].Trim() : "";
+            error = "❌ Укажите период: 27.11 – 30.11";
+            return false;
         }
 
-        // --- группа: только /setgroup ---
+        var formats = new[]
+        {
+            "dd.MM",
+            "d.M",
+            "dd.MM.yyyy",
+            "d.M.yyyy"
+        };
+
+        if (!DateOnly.TryParseExact(
+                parts[0],
+                formats,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var start))
+        {
+            error = "❌ Неправильная дата начала.";
+            return false;
+        }
+
+        if (!DateOnly.TryParseExact(
+                parts[1],
+                formats,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var end))
+        {
+            error = "❌ Неправильная дата окончания.";
+            return false;
+        }
+
+        var today = DateOnly.FromDateTime(DateTime.Today);
+
+        // Если год не указан, используем текущий год.
+
+        if (start.Year == 1)
+            start = new DateOnly(today.Year, start.Month, start.Day);
+
+        if (end.Year == 1)
+            end = new DateOnly(start.Year, end.Month, end.Day);
+
+        // Переход через Новый год.
+
+        if (end < start &&
+            parts[0].Length <= 5 &&
+            parts[1].Length <= 5 &&
+            start.Month > end.Month)
+        {
+            end = new DateOnly(
+                start.Year + 1,
+                end.Month,
+                end.Day);
+        }
+
+        if (start < today)
+        {
+            error = "❌ Дата начала не может быть в прошлом.";
+            return false;
+        }
+
+        if (end < start)
+        {
+            error = "❌ Дата окончания раньше даты начала.";
+            return false;
+        }
+
+        if (end.DayNumber - start.DayNumber > 365)
+        {
+            error = "❌ Максимальный период — 365 дней.";
+            return false;
+        }
+
+        return true;
+    }
+
+    // -------------------------------------------------------------
+    // VALIDATION: TIME
+    // -------------------------------------------------------------
+
+    private static bool ValidTime(string value)
+    {
+        return TimeOnly.TryParseExact(
+            value,
+            "HH:mm",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.None,
+            out _);
+    }
+
+    // -------------------------------------------------------------
+    // VALIDATION: DETAILS
+    // -------------------------------------------------------------
+
+    private static bool ValidateDetails(
+        string key,
+        string code,
+        string text,
+        out string error)
+    {
+        error = "";
+
+        text = text.Trim();
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            error = "❌ Сообщение не может быть пустым.";
+            return false;
+        }
+
+        if (text.Length > 200)
+        {
+            error = "❌ Максимальная длина — 200 символов.";
+            return false;
+        }
+
+        if (code == "period")
+        {
+            return ValidatePeriod(text, out error);
+        }
+
+        if (key == "late" && code == "custom")
+        {
+            var match = Regex.Match(
+                text,
+                @"^до\s+(\d{1,2}:\d{2})$",
+                RegexOptions.IgnoreCase);
+
+            if (!match.Success || !ValidTime(match.Groups[1].Value))
+            {
+                error = "❌ Укажите время в формате: до 10:30";
+                return false;
+            }
+        }
+
+        if (key == "leave" && code == "custom")
+        {
+            var match = Regex.Match(
+                text,
+                @"^с\s+(\d{1,2}:\d{2})\s+до\s+(\d{1,2}:\d{2})$",
+                RegexOptions.IgnoreCase);
+
+            if (!match.Success)
+            {
+                error = "❌ Используйте формат: с 15:00 до 17:00";
+                return false;
+            }
+
+            var start = match.Groups[1].Value;
+            var end = match.Groups[2].Value;
+
+            if (!ValidTime(start) || !ValidTime(end))
+            {
+                error = "❌ Некорректное время.";
+                return false;
+            }
+
+            if (TimeOnly.Parse(start) >= TimeOnly.Parse(end))
+            {
+                error = "❌ Время окончания должно быть позже начала.";
+                return false;
+            }
+        }
+
+        if (key == "away" && code == "custom")
+        {
+            var match = Regex.Match(
+                text,
+                @"^на\s+(\d+)\s+(минут[уы]?|час(?:а|ов)?)$",
+                RegexOptions.IgnoreCase);
+
+            if (!match.Success ||
+                !int.TryParse(match.Groups[1].Value, out var amount) ||
+                amount <= 0 ||
+                amount > 1440)
+            {
+                error = "❌ Например: на 20 минут или на 1 час.";
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // -------------------------------------------------------------
+    // MESSAGE HANDLER
+    // -------------------------------------------------------------
+
+    private async Task OnMessage(JsonNode message)
+    {
+        var chat = message["chat"]!;
+
+        var chatId = chat["id"]!.GetValue<long>();
+
+        var type = chat["type"]!.GetValue<string>();
+
+        var from = message["from"];
+
+        if (from == null)
+            return;
+
+        var uid = from["id"]!.GetValue<long>();
+
+        var username = from["username"]?.GetValue<string>();
+
+        var text = message["text"]?.GetValue<string>()?.Trim();
+
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        string? command = null;
+
+        var args = "";
+
+        if (text.StartsWith('/'))
+        {
+            var split = text.Split(
+                ' ',
+                2,
+                StringSplitOptions.RemoveEmptyEntries);
+
+            command = split[0][1..]
+                .Split('@')[0]
+                .ToLowerInvariant();
+
+            args = split.Length > 1
+                ? split[1].Trim()
+                : "";
+        }
+
+        // ---------------------------------------------------------
+        // GROUP
+        // ---------------------------------------------------------
+
         if (type is "group" or "supergroup")
         {
-            if (cmd == "setgroup")
+            if (command == "setgroup")
             {
                 if (!IsAdmin(uid))
                 {
-                    await _tg.Send(chatId, "Только администратор бота может подключить группу.");
+                    await _tg.Send(
+                        chatId,
+                        "Только администратор может подключить группу.");
+
                     return;
                 }
+
                 _db.SetGroupId(chatId);
-                await _tg.Send(chatId, "✅ Группа подключена. Теперь статусы сотрудников будут приходить сюда.");
+
+                await _tg.Send(
+                    chatId,
+                    "✅ Группа успешно подключена.");
+
             }
+
             return;
         }
-        if (type != "private") return;
 
-        // --- команды в личке ---
-        switch (cmd)
+        if (type != "private")
+            return;
+
+        // ---------------------------------------------------------
+        // COMMANDS
+        // ---------------------------------------------------------
+
+        switch (command)
         {
             case "start":
                 _db.ClearState(uid);
-                var name = _db.GetName(uid);
-                if (name != null)
+
+                var existingName = _db.GetName(uid);
+
+                if (existingName != null)
                 {
-                    await _tg.Send(chatId, $"Привет, <b>{Esc(name)}</b>! Выберите статус:", MainMenu());
+                    await _tg.Send(
+                        chatId,
+                        $"Привет, <b>{Esc(existingName)}</b>!\n\nВыберите статус:",
+                        MainMenu());
                 }
                 else
                 {
                     _db.SetState(uid, "reg");
-                    await _tg.Send(chatId, "👋 Добро пожаловать!\n\nНапишите ваши <b>Имя и Фамилию</b> (например: Фаридун Икромзода):");
+
+                    await _tg.Send(
+                        chatId,
+                        "👋 Добро пожаловать!\n\nНапишите ваши <b>Имя и Фамилию</b>:");
                 }
+
                 return;
 
-            case "name":
-                _db.SetState(uid, "reg");
-                await _tg.Send(chatId, "Напишите новые <b>Имя и Фамилию</b>:");
+            case "cancel":
+                _db.ClearState(uid);
+
+                await _tg.Send(
+                    chatId,
+                    "❌ Действие отменено.\nВыберите статус:",
+                    MainMenu());
+
                 return;
 
             case "menu":
                 _db.ClearState(uid);
-                if (_db.GetName(uid) == null) { await _tg.Send(chatId, "Сначала зарегистрируйтесь: /start"); return; }
-                await _tg.Send(chatId, "Выберите статус:", MainMenu());
+
+                if (_db.GetName(uid) == null)
+                {
+                    await _tg.Send(
+                        chatId,
+                        "Сначала зарегистрируйтесь: /start");
+
+                    return;
+                }
+
+                await _tg.Send(
+                    chatId,
+                    "Выберите статус:",
+                    MainMenu());
+
+                return;
+
+            case "name":
+                _db.SetState(uid, "reg");
+
+                await _tg.Send(
+                    chatId,
+                    "Напишите новые <b>Имя и Фамилию</b>:");
+
                 return;
 
             case "users":
-                if (!IsAdmin(uid)) return;
+                if (!IsAdmin(uid))
+                    return;
+
                 var users = _db.Users();
-                if (users.Count == 0) { await _tg.Send(chatId, "Пользователей пока нет."); return; }
-                await _tg.Send(chatId, string.Join("\n", users.Select(u =>
-                    $"<code>{u.Id}</code> — {Esc(u.Name)}" + (u.Username != null ? $" (@{Esc(u.Username)})" : ""))));
+
+                if (users.Count == 0)
+                {
+                    await _tg.Send(chatId, "Пользователей пока нет.");
+                    return;
+                }
+
+                await _tg.Send(
+                    chatId,
+                    string.Join("\n", users.Select(x =>
+                        $"<code>{x.Id}</code> — {Esc(x.Name)}" +
+                        (x.Username != null
+                            ? $" (@{Esc(x.Username)})"
+                            : ""))));
+
                 return;
 
             case "rename":
-                if (!IsAdmin(uid)) return;
-                var rp = args.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
-                if (rp.Length < 2 || !long.TryParse(rp[0], out var rid) || !ValidName(rp[1]))
+                if (!IsAdmin(uid))
+                    return;
+
+                var renameParts = args.Split(
+                    ' ',
+                    2,
+                    StringSplitOptions.RemoveEmptyEntries);
+
+                if (renameParts.Length < 2 ||
+                    !long.TryParse(renameParts[0], out var renameId) ||
+                    !ValidName(renameParts[1]))
                 {
-                    await _tg.Send(chatId, "Использование: /rename &lt;id&gt; Имя Фамилия");
+                    await _tg.Send(
+                        chatId,
+                        "Использование: /rename <code>id Имя Фамилия</code>");
+
                     return;
                 }
-                await _tg.Send(chatId, _db.Rename(rid, NormalizeName(rp[1]))
-                    ? "✅ Имя изменено."
-                    : "Пользователь с таким id не найден (/users).");
+
+                await _tg.Send(
+                    chatId,
+                    _db.Rename(renameId, NormalizeName(renameParts[1]))
+                        ? "✅ Имя изменено."
+                        : "Пользователь не найден.");
+
                 return;
 
             case "add":
-                if (!IsAdmin(uid)) return;
-                var ap = args.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
-                if (ap.Length < 2 || !long.TryParse(ap[0], out var aid) || !ValidName(ap[1]))
+                if (!IsAdmin(uid))
+                    return;
+
+                var addParts = args.Split(
+                    ' ',
+                    2,
+                    StringSplitOptions.RemoveEmptyEntries);
+
+                if (addParts.Length < 2 ||
+                    !long.TryParse(addParts[0], out var addId) ||
+                    !ValidName(addParts[1]))
                 {
-                    await _tg.Send(chatId, "Использование: /add &lt;telegram_id&gt; Имя Фамилия");
+                    await _tg.Send(
+                        chatId,
+                        "Использование: /add <code>telegram_id Имя Фамилия</code>");
+
                     return;
                 }
-                _db.SaveUser(aid, NormalizeName(ap[1]), null);
+
+                _db.SaveUser(
+                    addId,
+                    NormalizeName(addParts[1]),
+                    null);
+
                 await _tg.Send(chatId, "✅ Сотрудник добавлен.");
+
                 return;
 
             case "delete":
-                if (!IsAdmin(uid)) return;
-                if (!long.TryParse(args, out var did))
+                if (!IsAdmin(uid))
+                    return;
+
+                if (!long.TryParse(args, out var deleteId))
                 {
-                    await _tg.Send(chatId, "Использование: /delete &lt;id&gt;");
+                    await _tg.Send(
+                        chatId,
+                        "Использование: /delete <code>id</code>");
+
                     return;
                 }
-                _db.DeleteUser(did);
+
+                _db.DeleteUser(deleteId);
+
                 await _tg.Send(chatId, "🗑 Пользователь удалён.");
+
                 return;
         }
 
-        if (cmd != null) return; // неизвестная команда
+        if (command != null)
+            return;
 
-        // --- обычный текст: смотрим состояние диалога ---
+        // ---------------------------------------------------------
+        // USER REGISTRATION
+        // ---------------------------------------------------------
+
         var state = _db.GetState(uid);
+
         if (state == null)
         {
             if (_db.GetName(uid) == null)
             {
                 _db.SetState(uid, "reg");
-                await _tg.Send(chatId, "Напишите ваши <b>Имя и Фамилию</b> (например: Фаридун Икромзода):");
+
+                await _tg.Send(
+                    chatId,
+                    "Напишите ваши <b>Имя и Фамилию</b>.");
+
+                return;
             }
-            else
-            {
-                await _tg.Send(chatId, "Выберите статус:", MainMenu());
-            }
+
+            await _tg.Send(
+                chatId,
+                "Сначала выберите статус:",
+                MainMenu());
+
             return;
         }
 
         if (state.Value.State == "reg")
         {
-            var full = NormalizeName(text);
-            if (!ValidName(full))
+            var fullName = NormalizeName(text);
+
+            if (!ValidName(fullName))
             {
-                await _tg.Send(chatId, "Пожалуйста, напишите имя и фамилию через пробел, например: <b>Фаридун Икромзода</b>");
+                await _tg.Send(
+                    chatId,
+                    "❌ Напишите имя и фамилию через пробел.");
+
                 return;
             }
-            _db.SaveUser(uid, full, username);
+
+            _db.SaveUser(uid, fullName, username);
+
             _db.ClearState(uid);
-            await _tg.Send(chatId, $"✅ Сохранено: <b>{Esc(full)}</b>\n\nВыберите статус:", MainMenu());
+
+            await _tg.Send(
+                chatId,
+                $"✅ Сохранено: <b>{Esc(fullName)}</b>\n\nВыберите статус:",
+                MainMenu());
+
             return;
         }
 
-        if (state.Value.State == "details" && state.Value.Key != null)
+        // ---------------------------------------------------------
+        // WAITING FOR DETAILS
+        // ---------------------------------------------------------
+
+        if (state.Value.State == "details" &&
+            state.Value.Key != null)
         {
-            _db.ClearState(uid);
-            var detail = text.Length > 200 ? text[..200] : text;
-            await Publish(uid, chatId, state.Value.Key, detail);
+            var parts = state.Value.Key.Split(':', 2);
+
+            var statusKey = parts[0];
+
+            var durationCode = parts.Length > 1
+                ? parts[1]
+                : "";
+
+            if (!ValidateDetails(
+                    statusKey,
+                    durationCode,
+                    text,
+                    out var error))
+            {
+                await _tg.Send(
+                    chatId,
+                    error + "\n\nПопробуйте ещё раз.");
+
+                return;
+            }
+
+            if (!_db.TryTransitionState(
+                    uid,
+                    "details",
+                    state.Value.Key,
+                    "sending"))
+            {
+                await _tg.Send(
+                    chatId,
+                    "Действие уже обрабатывается.");
+
+                return;
+            }
+
+            await Publish(
+                uid,
+                chatId,
+                statusKey,
+                text);
+
+            return;
+        }
+
+        if (state.Value.State == "duration")
+        {
+            await _tg.Send(
+                chatId,
+                "Выберите продолжительность с помощью кнопок.");
+
+            return;
+        }
+
+        if (state.Value.State == "sending")
+        {
+            await _tg.Send(
+                chatId,
+                "⏳ Ваш статус отправляется. Подождите.");
+
+            return;
         }
     }
 
-    // ---------- нажатия на кнопки ----------
-    private async Task OnCallback(JsonNode cb)
-    {
-        var cbId = cb["id"]!.GetValue<string>();
-        var uid = cb["from"]!["id"]!.GetValue<long>();
-        var data = cb["data"]?.GetValue<string>() ?? "";
-        var msg = cb["message"];
-        if (msg == null) { await _tg.Answer(cbId); return; }
-        var chatId = msg["chat"]!["id"]!.GetValue<long>();
-        var msgId = msg["message_id"]!.GetValue<long>();
+    // -------------------------------------------------------------
+    // CALLBACK HANDLER
+    // -------------------------------------------------------------
 
-        if (_db.GetName(uid) == null)
+    private async Task OnCallback(JsonNode callback)
+    {
+        var callbackId = callback["id"]!.GetValue<string>();
+
+        var uid = callback["from"]!["id"]!.GetValue<long>();
+
+        var data = callback["data"]?.GetValue<string>() ?? "";
+
+        var message = callback["message"];
+
+        if (message == null)
         {
-            await _tg.Answer(cbId, "Сначала отправьте /start", true);
+            await _tg.Answer(callbackId);
             return;
         }
 
-        if (data == "menu")
+        var chatId = message["chat"]!["id"]!.GetValue<long>();
+
+        var messageId = message["message_id"]!.GetValue<long>();
+
+        if (_db.GetName(uid) == null)
+        {
+            await _tg.Answer(
+                callbackId,
+                "Сначала зарегистрируйтесь: /start",
+                true);
+
+            return;
+        }
+
+        var state = _db.GetState(uid);
+
+        // ---------------------------------------------------------
+        // CANCEL
+        // ---------------------------------------------------------
+
+        if (data == "cancel")
         {
             _db.ClearState(uid);
-            await _tg.Edit(chatId, msgId, "Выберите статус:", MainMenu());
-            await _tg.Answer(cbId);
+
+            await _tg.Edit(
+                chatId,
+                messageId,
+                "❌ Действие отменено.\n\nВыберите статус:",
+                MainMenu());
+
+            await _tg.Answer(callbackId);
+
             return;
         }
 
         var parts = data.Split(':');
 
-        // выбор статуса
-        if (parts[0] == "st" && parts.Length == 2 && Data.Find(parts[1]) is Status st)
+        // ---------------------------------------------------------
+        // SELECT STATUS
+        // ---------------------------------------------------------
+
+        if (parts[0] == "st" &&
+            parts.Length == 2 &&
+            Data.Find(parts[1]) is Status status)
         {
-            await _tg.Answer(cbId);
-            if (st.Key == "back")
+            // Нельзя выбрать второй статус,
+            // если предыдущий ещё не завершён.
+
+            if (state != null)
             {
-                await Publish(uid, chatId, st.Key, "");
+                await _tg.Answer(
+                    callbackId,
+                    "Сначала завершите или отмените предыдущее действие.",
+                    true);
+
+                return;
             }
-            else if (st.Key == "other")
+
+            await _tg.Answer(callbackId);
+
+            // RETURN TO WORK
+
+            if (status.Key == "back")
             {
-                _db.SetState(uid, "details", st.Key);
-                await _tg.Edit(chatId, msgId, "Напишите ваше сообщение для группы (например: на обучении до 16:00):");
+                if (!_db.TryStartState(uid, "sending", status.Key))
+                    return;
+
+                await Publish(
+                    uid,
+                    chatId,
+                    status.Key,
+                    "");
+
+                return;
             }
-            else
+
+            // OTHER
+
+            if (status.Key == "other")
             {
-                await _tg.Edit(chatId, msgId,
-                    $"{st.Emoji} <b>{char.ToUpper(st.Action[0]) + st.Action[1..]}</b>\nВыберите срок:", DurationsMenu(st));
+                if (!_db.TryStartState(uid, "details", "other:custom"))
+                    return;
+
+                await _tg.Edit(
+                    chatId,
+                    messageId,
+                    "Напишите ваше сообщение для группы:");
+
+                return;
             }
+
+            // NORMAL STATUS
+
+            if (!_db.TryStartState(
+                    uid,
+                    "duration",
+                    status.Key))
+            {
+                return;
+            }
+
+            await _tg.Edit(
+                chatId,
+                messageId,
+                $"{status.Emoji} <b>{char.ToUpper(status.Action[0]) + status.Action[1..]}</b>\n\nВыберите срок:",
+                DurationsMenu(status));
+
             return;
         }
 
-        // выбор срока
-        if (parts[0] == "du" && parts.Length == 3 && Data.Find(parts[1]) is Status st2)
+        // ---------------------------------------------------------
+        // SELECT DURATION
+        // ---------------------------------------------------------
+
+        if (parts[0] == "du" &&
+            parts.Length == 3 &&
+            Data.Find(parts[1]) is Status selectedStatus)
         {
-            var d = st2.Durs.FirstOrDefault(x => x.Code == parts[2]);
-            if (d == null) { await _tg.Answer(cbId, "Неизвестный вариант", true); return; }
-            await _tg.Answer(cbId);
-            if (d.Phrase != null)
+            if (state == null ||
+                state.Value.State != "duration" ||
+                state.Value.Key != selectedStatus.Key)
             {
-                await Publish(uid, chatId, st2.Key, d.Phrase);
+                await _tg.Answer(
+                    callbackId,
+                    "Эта кнопка уже недействительна.",
+                    true);
+
+                return;
             }
-            else
+
+            var duration = selectedStatus.Durs
+                .FirstOrDefault(x => x.Code == parts[2]);
+
+            if (duration == null)
             {
-                _db.SetState(uid, "details", st2.Key);
-                await _tg.Edit(chatId, msgId, d.Ask ?? "Напишите детали:");
+                await _tg.Answer(
+                    callbackId,
+                    "Неизвестный вариант.",
+                    true);
+
+                return;
             }
+
+            await _tg.Answer(callbackId);
+
+            // DIRECT PHRASE
+
+            if (duration.Phrase != null)
+            {
+                if (!_db.TryTransitionState(
+                        uid,
+                        "duration",
+                        selectedStatus.Key,
+                        "sending"))
+                {
+                    return;
+                }
+
+                await Publish(
+                    uid,
+                    chatId,
+                    selectedStatus.Key,
+                    duration.Phrase);
+
+                return;
+            }
+
+            // CUSTOM DETAILS
+
+            var detailsKey = $"{selectedStatus.Key}:{duration.Code}";
+
+            if (!_db.TryTransitionState(
+                    uid,
+                    "duration",
+                    selectedStatus.Key,
+                    "details",
+                    detailsKey))
+            {
+                return;
+            }
+
+            await _tg.Edit(
+                chatId,
+                messageId,
+                duration.Ask ?? "Напишите детали:");
+
             return;
         }
 
-        await _tg.Answer(cbId);
+        await _tg.Answer(callbackId);
     }
 
-    // ---------- отправка статуса в группу ----------
-    private async Task Publish(long uid, long chatId, string key, string detail)
+    // -------------------------------------------------------------
+    // PUBLISH STATUS
+    // -------------------------------------------------------------
+
+    private async Task Publish(
+        long uid,
+        long chatId,
+        string key,
+        string detail)
     {
         var name = _db.GetName(uid);
-        if (name == null) { await _tg.Send(chatId, "Сначала зарегистрируйтесь: /start"); return; }
 
-        var group = _db.GetGroupId() ?? _s.EnvGroup;
-        if (group == null)
+        if (name == null)
         {
-            await _tg.Send(chatId,
-                "⚠️ Группа ещё не подключена. Администратор должен добавить бота в группу и отправить там команду /setgroup");
+            _db.ClearState(uid);
+
+            await _tg.Send(
+                chatId,
+                "Сначала зарегистрируйтесь: /start");
+
             return;
         }
 
-        var st = Data.Find(key)!;
-        var parts = new List<string> { $"<b>{Esc(name)}</b>", st.Emoji };
-        if (st.Action != "") parts.Add(st.Action);
-        if (detail != "") parts.Add(Esc(detail));
-        var text = string.Join(' ', parts);
+        var group = _db.GetGroupId() ?? _settings.EnvGroup;
+
+        if (group == null)
+        {
+            _db.ClearState(uid);
+
+            await _tg.Send(
+                chatId,
+                "⚠️ Группа ещё не подключена.\n\n" +
+                "Администратор должен добавить бота в группу " +
+                "и отправить там команду /setgroup.");
+
+            return;
+        }
+
+        var status = Data.Find(key);
+
+        if (status == null)
+        {
+            _db.ClearState(uid);
+
+            await _tg.Send(chatId, "Неизвестный статус.");
+
+            return;
+        }
+
+        var messageParts = new List<string>
+        {
+            $"<b>{Esc(name)}</b>",
+            status.Emoji
+        };
+
+        if (status.Action != "")
+            messageParts.Add(status.Action);
+
+        if (detail != "")
+            messageParts.Add(Esc(detail));
+
+        var text = string.Join(' ', messageParts);
 
         try
         {
             await _tg.Send(group.Value, text);
+
+            _db.Log(uid, key, detail);
+
+            _db.ClearState(uid);
+
+            await _tg.Send(
+                chatId,
+                "✅ <b>Отправлено в группу:</b>\n\n" + text,
+                MainMenu());
         }
         catch (Exception e)
         {
-            _log.LogError(e, "Не удалось отправить в группу");
-            await _tg.Send(chatId, "❌ Не удалось отправить в группу: " + Esc(e.Message));
-            return;
-        }
+            _log.LogError(
+                e,
+                "Failed to publish status for {UserId}",
+                uid);
 
-        _db.Log(uid, key, detail);
-        await _tg.Send(chatId, "✅ Отправлено в группу:\n\n" + text, MainMenu());
+            _db.ClearState(uid);
+
+            await _tg.Send(
+                chatId,
+                "❌ Не удалось отправить статус.\n\n" +
+                Esc(e.Message),
+                MainMenu());
+        }
     }
 }
